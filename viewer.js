@@ -105,7 +105,18 @@ class KvsViewer {
     setText(els.signalingStatus, "resolving endpoints");
 
     const endpoints = await this.getSignalingEndpoints(config);
-    const iceServers = await this.getIceServers(config, endpoints.httpsEndpoint);
+    const iceServers = [
+      {urls : `stun:stun.kinesisvideo.${region}.amazonaws.com:443`},
+      ...iceServerList
+          .map((s) => ({
+                 urls : (s.Uris ?? [])
+                            .filter((uri) => uri.startsWith("turn:") &&
+                                             uri.includes("transport=udp")),
+                 username : s.Username,
+                 credential : s.Password,
+               }))
+          .filter((s) => s.urls.length > 0),
+    ];
 
     this.pc = new RTCPeerConnection({ iceServers });
     this.installPeerConnectionHandlers();
@@ -229,16 +240,17 @@ class KvsViewer {
       log("INFO", "Signaling connection opened");
       setText(els.signalingStatus, "open");
 
-      // Viewer は映像を受信するだけ。
-      // audio m-line を出さないため、video transceiver だけを追加する。
+      this.pc.addTransceiver("audio", {
+        direction : "recvonly",
+      });
+
       this.pc.addTransceiver("video", {
         direction: "recvonly",
       });
 
       const offer = await this.pc.createOffer();
-
       await this.pc.setLocalDescription(offer);
-      this.signalingClient.sendSdpOffer(offer);
+      this.signalingClient.sendSdpOffer(this.pc.localDescription);
 
       log("INFO", "Sent video-only SDP offer");
     });
