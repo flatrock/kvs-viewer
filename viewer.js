@@ -36,6 +36,45 @@ const els = {
   recStatus: $("recStatus"),
 };
 
+
+// ------------------------------------------------------------
+// ICE candidate policy for ESP WebRTC compatibility
+// ------------------------------------------------------------
+// ESP WebRTC currently keeps only a limited number of remote candidates.
+// To avoid filling that limit with host/srflx/TURNS-TCP candidates, this
+// viewer sends only TURN/UDP relay candidates to the KVS Master.
+const MAX_TURN_SERVER_CONFIGS = 1;
+const USE_RELAY_ONLY = true;
+const SEND_ONLY_TURN_UDP_RELAY_CANDIDATES = true;
+
+function isTurnUdpUrl(url) {
+  return typeof url === "string" && url.startsWith("turn:") && url.includes("transport=udp");
+}
+
+function isRelayCandidate(candidateText) {
+  return typeof candidateText === "string" && candidateText.includes(" typ relay ");
+}
+
+function shouldSendIceCandidate(candidate) {
+  if (!SEND_ONLY_TURN_UDP_RELAY_CANDIDATES) return true;
+
+  const candidateText = candidate?.candidate ?? "";
+  const url = candidate?.url ?? "";
+  return isRelayCandidate(candidateText) && isTurnUdpUrl(url);
+}
+
+function summarizeIceCandidate(candidate) {
+  const candidateText = candidate?.candidate ?? "";
+  const type = candidateText.match(/ typ (\S+)/)?.[1] ?? "unknown";
+  return {
+    sdpMid: candidate?.sdpMid,
+    sdpMLineIndex: candidate?.sdpMLineIndex,
+    type,
+    url: candidate?.url,
+    relayProtocol: candidate?.relayProtocol,
+  };
+}
+
 function log(level, ...args) {
   const line = `[${new Date().toISOString()}] [${level}] ${args.map(formatLogArg).join(" ")}`;
   console[level === "ERROR" ? "error" : "log"](...args);
@@ -107,7 +146,10 @@ class KvsViewer {
     const endpoints = await this.getSignalingEndpoints(config);
     const iceServers = await this.getIceServers(config, endpoints.httpsEndpoint);
 
-    this.pc = new RTCPeerConnection({ iceServers });
+    this.pc = new RTCPeerConnection({
+      iceServers,
+      iceTransportPolicy: USE_RELAY_ONLY ? "relay" : "all",
+    });
     this.installPeerConnectionHandlers();
 
     this.signalingClient = new KVSWebRTC.SignalingClient({
@@ -181,17 +223,28 @@ class KvsViewer {
     });
 
     const response = await kvs.send(new GetIceServerConfigCommand({ ChannelARN: config.channelArn }));
-    const iceServers = [
-      { urls: `stun:stun.kinesisvideo.${config.region}.amazonaws.com:443` },
-      ...(response.IceServerList ?? []).map((s) => ({
-        urls: s.Uris ?? [],
+
+    const turnUdpServers = (response.IceServerList ?? [])
+      .slice(0, MAX_TURN_SERVER_CONFIGS)
+      .map((s) => ({
+        urls: (s.Uris ?? []).filter(isTurnUdpUrl),
         username: s.Username,
         credential: s.Password,
-      })),
-    ];
+      }))
+      .filter((s) => s.urls.length > 0);
 
-    log("INFO", "Loaded ICE servers", { count: iceServers.length });
-    return iceServers;
+    if (turnUdpServers.length === 0) {
+      throw new Error("No TURN/UDP ICE server was returned by KVS.");
+    }
+
+    log("INFO", "Loaded filtered ICE servers", {
+      policy: USE_RELAY_ONLY ? "relay-only" : "all",
+      maxTurnServerConfigs: MAX_TURN_SERVER_CONFIGS,
+      serverCount: turnUdpServers.length,
+      urls: turnUdpServers.flatMap((s) => s.urls),
+    });
+
+    return turnUdpServers;
   }
 
   installPeerConnectionHandlers() {
@@ -213,9 +266,16 @@ class KvsViewer {
     };
 
     this.pc.onicecandidate = (event) => {
-      if (event.candidate && this.signalingClient) {
-        this.signalingClient.sendIceCandidate(event.candidate);
+      if (!event.candidate || !this.signalingClient) return;
+
+      const summary = summarizeIceCandidate(event.candidate);
+      if (!shouldSendIceCandidate(event.candidate)) {
+        log("INFO", "Dropped local ICE candidate", summary);
+        return;
       }
+
+      log("INFO", "Sending local ICE candidate", summary);
+      this.signalingClient.sendIceCandidate(event.candidate);
     };
 
     this.pc.oniceconnectionstatechange = () => {
@@ -241,7 +301,7 @@ class KvsViewer {
       await this.pc.setLocalDescription(offer);
       this.signalingClient.sendSdpOffer(this.pc.localDescription);
 
-      log("INFO", "Sent video-only SDP offer");
+      log("INFO", "Sent audio+video recvonly SDP offer");
     });
 
     this.signalingClient.on("sdpAnswer", async (answer) => {
