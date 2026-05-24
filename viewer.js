@@ -105,18 +105,7 @@ class KvsViewer {
     setText(els.signalingStatus, "resolving endpoints");
 
     const endpoints = await this.getSignalingEndpoints(config);
-    const iceServers = [
-      {urls : `stun:stun.kinesisvideo.${region}.amazonaws.com:443`},
-      ...iceServerList
-          .map((s) => ({
-                 urls : (s.Uris ?? [])
-                            .filter((uri) => uri.startsWith("turn:") &&
-                                             uri.includes("transport=udp")),
-                 username : s.Username,
-                 credential : s.Password,
-               }))
-          .filter((s) => s.urls.length > 0),
-    ];
+    const iceServers = await this.getIceServers(config, endpoints.httpsEndpoint);
 
     this.pc = new RTCPeerConnection({ iceServers });
     this.installPeerConnectionHandlers();
@@ -241,7 +230,7 @@ class KvsViewer {
       setText(els.signalingStatus, "open");
 
       this.pc.addTransceiver("audio", {
-        direction : "recvonly",
+        direction: "recvonly",
       });
 
       this.pc.addTransceiver("video", {
