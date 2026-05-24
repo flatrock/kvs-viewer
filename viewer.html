@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>KVS WebRTC Viewer</title>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/css/bootstrap.min.css" />
+  <link rel="stylesheet" href="./app.css" />
+  <link rel="icon" type="image/png" href="favicon.ico" />
+</head>
+<body>
+  <main class="container mt-3 mb-5">
+    <header class="mb-4">
+      <h1>KVS WebRTC Viewer</h1>
+      <p class="text-muted mb-0">
+        Connect to an Amazon Kinesis Video Streams WebRTC signaling channel as a viewer.
+      </p>
+    </header>
+
+    <section class="card mb-4">
+      <div class="card-header">
+        <h2 class="h5 mb-0">Connection</h2>
+      </div>
+      <div class="card-body">
+        <form id="form" onsubmit="return false">
+          <div class="form-group">
+            <label for="region">Region</label>
+            <input type="text" class="form-control" id="region" placeholder="Region" value="us-west-2" autocomplete="off" required />
+          </div>
+
+          <h3 class="h5 mt-4">AWS Credentials</h3>
+          <div class="form-group">
+            <label for="accessKeyId">Access Key ID</label>
+            <input type="text" class="form-control" id="accessKeyId" placeholder="Access key id" autocomplete="off" required />
+          </div>
+          <div class="form-group">
+            <label for="secretAccessKey">Secret Access Key</label>
+            <input type="password" class="form-control" id="secretAccessKey" placeholder="Secret access key" autocomplete="off" required />
+          </div>
+          <div class="form-group">
+            <label for="sessionToken">Session Token <small>(optional)</small></label>
+            <input type="password" class="form-control" id="sessionToken" placeholder="Session token" autocomplete="off" />
+          </div>
+
+          <h3 class="h5 mt-4">Signaling Channel</h3>
+          <div class="form-group">
+            <label for="channelArn">Channel ARN</label>
+            <input type="text" class="form-control" id="channelArn" placeholder="arn:aws:kinesisvideo:...:channel/..." required />
+          </div>
+          <div class="form-group">
+            <label for="clientId">Client ID <small>(optional)</small></label>
+            <input type="text" class="form-control" id="clientId" placeholder="Random UUID is used when empty" autocomplete="off" />
+          </div>
+
+          <div class="d-flex align-items-center flex-wrap mt-4">
+            <button id="viewer-button" type="submit" class="btn btn-primary mr-2 mb-2">Start Viewer</button>
+            <button id="stop-viewer-button" type="button" class="btn btn-danger mr-2 mb-2" disabled>Stop Viewer</button>
+            <span class="badge badge-secondary mr-2 mb-2">Signaling: <span id="signalingStatus">idle</span></span>
+            <span class="badge badge-secondary mr-2 mb-2">ICE: <span id="iceStatus">idle</span></span>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section class="card mb-4">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h2 class="h5 mb-0">Preview</h2>
+        <small class="text-muted">Received media from Master</small>
+      </div>
+      <div class="card-body">
+        <div class="video-container preview-container">
+          <video id="remoteVideo" class="remote-view" autoplay playsinline controls></video>
+        </div>
+      </div>
+    </section>
+
+    <section class="card mb-4">
+      <div class="card-header">
+        <h2 class="h5 mb-0">REC</h2>
+      </div>
+      <div class="card-body">
+        <p class="text-muted">
+          Sends decoded video frames to a local recorder WebSocket server at <code>ws://127.0.0.1:8080</code>.
+        </p>
+        <div class="form-row align-items-end">
+          <div class="form-group col-md-3">
+            <label>Recorder WebSocket</label>
+            <input id="recorderWsUrl" class="form-control" value="ws://127.0.0.1:8080" />
+          </div>
+          <div class="form-group col-md-2">
+            <label for="recorderId">Recorder ID</label>
+            <input id="recorderId" class="form-control" value="1" />
+          </div>
+          <div class="form-group col-md-2">
+            <label for="fps">FPS</label>
+            <input id="fps" type="number" min="1" max="120" class="form-control" value="30" />
+          </div>
+          <div class="form-group col-md-3 segment-field" id="segmentTimeField">
+            <label for="segmentTime">Segment seconds</label>
+            <input id="segmentTime" type="number" min="1" class="form-control" value="60" />
+          </div>
+          <div class="form-group col-md-2">
+            <div class="form-check mb-2">
+              <input id="segmentEnabled" class="form-check-input" type="checkbox" />
+              <label for="segmentEnabled" class="form-check-label">Segment</label>
+            </div>
+          </div>
+        </div>
+        <div class="d-flex align-items-center flex-wrap">
+          <button id="recStartBtn" type="button" class="btn btn-success mr-2 mb-2" disabled>Start REC</button>
+          <button id="recStopBtn" type="button" class="btn btn-warning mr-2 mb-2" disabled>Stop REC</button>
+          <span class="badge badge-secondary mr-2 mb-2">Recorder WS: <span id="wsStatus">disconnected</span></span>
+          <span class="badge badge-secondary mr-2 mb-2">REC: <span id="recStatus">idle</span></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card bg-light mb-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h2 class="h5 mb-0">Logs</h2>
+        <button id="clear-logs" class="btn btn-sm btn-light" type="button">Clear Logs</button>
+      </div>
+      <pre id="logs" class="card-body text-monospace preserve-whitespace mb-0"></pre>
+    </section>
+  </main>
+
+  <script src="https://webrtc.github.io/adapter/adapter-latest.js"></script>
+  <script src="./dist/kvs-webrtc.min.js"></script>
+  <script type="module" src="./viewer.js"></script>
+</body>
+</html>

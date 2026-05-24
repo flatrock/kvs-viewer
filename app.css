@@ -1,0 +1,42 @@
+body {
+  background: #f7f8fa;
+}
+
+.card {
+  border-radius: 0.75rem;
+}
+
+.video-container {
+  background: #111;
+  border-radius: 0.75rem;
+  overflow: hidden;
+  width: 100%;
+}
+
+.preview-container {
+  aspect-ratio: 16 / 9;
+}
+
+.remote-view {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 360px;
+  object-fit: contain;
+  background: #111;
+}
+
+.preserve-whitespace {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+#logs {
+  max-height: 360px;
+  overflow: auto;
+  font-size: 0.85rem;
+}
+
+.segment-disabled {
+  opacity: 0.5;
+}
