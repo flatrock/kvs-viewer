@@ -52,7 +52,7 @@ const els = {
 // - Send at most one relay/UDP candidate per m-line to avoid overflowing the
 //   embedded peer's remote candidate table.
 // - Offer m-line order is video only; video becomes BUNDLE mid:0.
-const USE_RELAY_ONLY = true;
+const USE_RELAY_ONLY = false;
 const USE_ONLY_ONE_TURN_SERVER_SET = true;
 const ADD_KVS_STUN_SERVER = false;
 const DEFER_ICE_CANDIDATES_UNTIL_OFFER_SENT = true;
