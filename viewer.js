@@ -41,29 +41,175 @@ const els = {
 // ------------------------------------------------------------
 // ICE policy
 // ------------------------------------------------------------
-// Video-only offer variant for the M5Stack/ESP WebRTC Master.
+// P2P-first video-only offer variant for the M5Stack/ESP WebRTC Master.
 //
 // Key points:
-// - Relay-only mode to prevent Chrome from gathering host/srflx candidates.
-// - Use only one TURN server set from GetIceServerConfig.
-// - Keep only turn:...transport=udp from that one TURN set.
-// - Do NOT send ICE candidates before SDP_OFFER is sent.
-// - After SDP_OFFER is sent, send only relay/UDP candidates.
-// - Send at most one relay/UDP candidate per m-line to avoid overflowing the
-//   embedded peer's remote candidate table.
+// - Default mode is no-relay: allow UDP host/srflx candidates and reject relay.
+// - KVS TURN servers are not used unless iceMode=all or iceMode=relay-only.
+// - Browser mDNS host candidates can be rewritten with viewerIp, but the
+//   current ESP-side mDNS resolver also supports viewerIp-free operation.
+// - Candidate sending is deferred until SDP_OFFER is sent.
+// - Local candidates are filtered and capped per m-line to avoid overflowing
+//   the embedded peer's remote candidate table.
 // - Offer m-line order is video only; video becomes BUNDLE mid:0.
+//
+// URL option:
+//   iceMode=lan-only    : send UDP host candidates only; reject relay/srflx
+//   iceMode=no-relay    : send UDP host + srflx candidates; reject relay
+//   iceMode=all         : allow UDP host + srflx + relay; use KVS TURN
+//   iceMode=relay-only  : send relay/UDP only; use KVS TURN
+// Legacy defaults are kept for compatibility; runtime behavior is controlled by iceMode.
 const USE_RELAY_ONLY = false;
+const USE_KVS_TURN_SERVERS = false;
 const USE_ONLY_ONE_TURN_SERVER_SET = true;
 const ADD_KVS_STUN_SERVER = false;
 const DEFER_ICE_CANDIDATES_UNTIL_OFFER_SENT = true;
-const SEND_RELAY_UDP_ONLY = true;
+const SEND_RELAY_UDP_ONLY = false;
+const DROP_RELAY_CANDIDATES = true;
 const MAX_RELAY_UDP_CANDIDATES_PER_MID = 1;
 const ICE_SERVER_URLS_TURN_UDP_ONLY = true;
+const VIEWER_HOST_CANDIDATE_IP_PARAM = "viewerIp";
+const ICE_MODE_PARAM = "iceMode";
+const DEFAULT_ICE_MODE = "no-relay";
+const VALID_ICE_MODES = new Set(["lan-only", "no-relay", "all", "relay-only"]);
+const MAX_LOCAL_UDP_CANDIDATES_PER_MID = 2;
+
+function readIcePolicyFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const requestedMode = (params.get(ICE_MODE_PARAM) || DEFAULT_ICE_MODE).trim().toLowerCase();
+  const mode = VALID_ICE_MODES.has(requestedMode) ? requestedMode : DEFAULT_ICE_MODE;
+
+  if (mode !== requestedMode) {
+    log("WARN", "Ignored invalid iceMode URL parameter", { requestedMode, fallbackMode: mode });
+  }
+
+  return {
+    mode,
+    useRelayOnly: mode === "relay-only",
+    useKvsTurnServers: mode === "all" || mode === "relay-only",
+    dropRelay: mode === "lan-only" || mode === "no-relay",
+    allowSrflx: mode === "no-relay" || mode === "all",
+    allowRelay: mode === "all" || mode === "relay-only",
+  };
+}
+
+function getCandidateText(candidate) {
+  return candidate?.candidate ?? "";
+}
+
+function getCandidateType(candidate) {
+  return getCandidateText(candidate).match(/ typ (\S+)/)?.[1] ?? "unknown";
+}
+
+function isUdpCandidate(candidate) {
+  return getCandidateText(candidate).includes(" udp ");
+}
+
+function shouldSendIceCandidateForPolicy(candidate, policy) {
+  const type = getCandidateType(candidate);
+
+  if (!isUdpCandidate(candidate)) return false;
+  if (type === "host") return true;
+  if (type === "srflx") return policy.allowSrflx;
+  if (type === "relay") return policy.allowRelay && isRelayUdpCandidate(candidate);
+  return false;
+}
 
 function isRelayCandidate(candidateText) {
   return typeof candidateText === "string" && candidateText.includes(" typ relay ");
 }
 
+
+function isIceCandidateRelay(candidate) {
+  return isRelayCandidate(candidate?.candidate ?? "");
+}
+
+function readViewerHostCandidateIpFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const value = params.get(VIEWER_HOST_CANDIDATE_IP_PARAM)?.trim();
+  if (!value) return "";
+
+  const ipv4Pattern = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+  if (!ipv4Pattern.test(value)) {
+    log("WARN", "Ignored invalid viewerIp URL parameter", { viewerIp: value });
+    return "";
+  }
+  return value;
+}
+
+function isMdnsCandidateAddress(address) {
+  return typeof address === "string" && address.endsWith(".local");
+}
+
+function rewriteCandidateAddress(candidateText, replacementIp) {
+  if (!replacementIp || typeof candidateText !== "string") return candidateText;
+
+  const tokens = candidateText.split(" ");
+  if (tokens.length < 8) return candidateText;
+
+  const addressIndex = 4;
+  const typeIndex = tokens.indexOf("typ");
+  const candidateType = typeIndex >= 0 ? tokens[typeIndex + 1] : "";
+
+  if (candidateType !== "host") return candidateText;
+  if (!isMdnsCandidateAddress(tokens[addressIndex])) return candidateText;
+
+  const originalAddress = tokens[addressIndex];
+  tokens[addressIndex] = replacementIp;
+
+  const rewritten = tokens.join(" ");
+  log("INFO", "Rewrote mDNS host candidate address", { from: originalAddress, to: replacementIp });
+  return rewritten;
+}
+
+function rewriteIceCandidateForSignaling(candidate, replacementIp) {
+  if (!candidate || !replacementIp) return candidate;
+  const originalCandidateText = candidate.candidate ?? "";
+  const rewrittenCandidateText = rewriteCandidateAddress(originalCandidateText, replacementIp);
+  if (rewrittenCandidateText === originalCandidateText) return candidate;
+  return new RTCIceCandidate({
+    candidate: rewrittenCandidateText,
+    sdpMid: candidate.sdpMid,
+    sdpMLineIndex: candidate.sdpMLineIndex,
+    usernameFragment: candidate.usernameFragment,
+  });
+}
+
+function rewriteMdnsCandidatesInSdp(sdp, replacementIp) {
+  if (!replacementIp || typeof sdp !== "string") return sdp;
+  return sdp
+    .split(/\r\n|\n/)
+    .map((line) => {
+      if (!line.startsWith("a=candidate:")) return line;
+      const rewrittenCandidate = rewriteCandidateAddress(line.slice("a=".length), replacementIp);
+      return `a=${rewrittenCandidate}`;
+    })
+    .join("\r\n");
+}
+
+function rewriteLocalDescriptionForSignaling(desc, replacementIp) {
+  if (!desc?.sdp || !replacementIp) return desc;
+  const rewrittenSdp = rewriteMdnsCandidatesInSdp(desc.sdp, replacementIp);
+  if (rewrittenSdp === desc.sdp) return desc;
+  log("INFO", "Rewrote mDNS host candidates in local SDP offer", { viewerIp: replacementIp });
+  return new RTCSessionDescription({ type: desc.type, sdp: rewrittenSdp });
+}
+
+function removeRelayCandidatesFromSdp(sdp) {
+  if (typeof sdp !== "string") return sdp;
+  return sdp
+    .split(/\r\n|\n/)
+    .filter((line) => !(line.startsWith("a=candidate:") && line.includes(" typ relay ")))
+    .join("\r\n");
+}
+
+function sanitizeRemoteDescription(desc, dropRelayCandidates) {
+  if (!dropRelayCandidates || !desc?.sdp) return desc;
+  const filteredSdp = removeRelayCandidatesFromSdp(desc.sdp);
+  if (filteredSdp === desc.sdp) return desc;
+  log("INFO", "Dropped relay candidates from remote SDP");
+  return new RTCSessionDescription({ type: desc.type, sdp: filteredSdp });
+}
 function isTurnUdpUrl(url) {
   return typeof url === "string" && url.startsWith("turn:") && url.includes("transport=udp");
 }
@@ -126,7 +272,7 @@ function preferH264CodecForTransceiver(transceiver) {
 
 function summarizeIceCandidate(candidate) {
   const candidateText = candidate?.candidate ?? "";
-  const type = candidateText.match(/ typ (\S+)/)?.[1] ?? "unknown";
+  const type = getCandidateType(candidate);
   return {
     sdpMid: candidate?.sdpMid,
     sdpMLineIndex: candidate?.sdpMLineIndex,
@@ -209,13 +355,21 @@ class KvsViewer {
     this.sdpOfferSent = false;
     this.queuedLocalIceCandidates = [];
     this.sentRelayUdpCandidateCountsByMid = new Map();
+    this.sentLocalCandidateCountsByMid = new Map();
+    this.viewerHostCandidateIp = "";
+    this.icePolicy = readIcePolicyFromUrl();
   }
 
   async start(config) {
+    this.icePolicy = readIcePolicyFromUrl();
+    this.viewerHostCandidateIp = readViewerHostCandidateIpFromUrl();
+
     log("INFO", "Starting viewer", {
       region: config.region,
       channelArn: config.channelArn,
       clientId: config.clientId,
+      viewerHostCandidateIp: this.viewerHostCandidateIp || "(not set)",
+      iceMode: this.icePolicy.mode,
     });
     this.resetCandidateGate();
     setText(els.signalingStatus, "resolving endpoints");
@@ -225,7 +379,7 @@ class KvsViewer {
 
     this.pc = new RTCPeerConnection({
       iceServers,
-      iceTransportPolicy: USE_RELAY_ONLY ? "relay" : "all",
+      iceTransportPolicy: this.icePolicy.useRelayOnly ? "relay" : "all",
     });
 
     this.installPeerConnectionHandlers();
@@ -303,6 +457,23 @@ class KvsViewer {
   }
 
   async getIceServers(config, httpsEndpoint) {
+    if (!this.icePolicy.useKvsTurnServers) {
+      const iceServers = [];
+      if (ADD_KVS_STUN_SERVER) {
+        iceServers.push({ urls: [`stun:stun.kinesisvideo.${config.region}.amazonaws.com:443`] });
+      }
+      log("INFO", "Loaded ICE servers", {
+        policy: this.icePolicy.mode,
+        useKvsTurnServers: false,
+        addKvsStunServer: ADD_KVS_STUN_SERVER,
+        deferIceCandidatesUntilOfferSent: DEFER_ICE_CANDIDATES_UNTIL_OFFER_SENT,
+        sendCandidates: this.icePolicy.mode,
+        serverCount: iceServers.length,
+        urls: iceServers.flatMap((s) => s.urls),
+      });
+      return iceServers;
+    }
+
     const kvs = new KinesisVideoSignalingClient({
       region: config.region,
       credentials: config.credentials,
@@ -333,16 +504,17 @@ class KvsViewer {
 
     iceServers.push(...turnServers);
 
-    if (iceServers.length === 0) {
+    if (this.icePolicy.useKvsTurnServers && iceServers.length === 0) {
       throw new Error("No ICE server was returned by KVS.");
     }
 
     log("INFO", "Loaded ICE servers", {
-      policy: USE_RELAY_ONLY ? "relay-only" : "all",
+      policy: this.icePolicy.mode,
+      useKvsTurnServers: this.icePolicy.useKvsTurnServers,
       useOnlyOneTurnServerSet: USE_ONLY_ONE_TURN_SERVER_SET,
       addKvsStunServer: ADD_KVS_STUN_SERVER,
       deferIceCandidatesUntilOfferSent: DEFER_ICE_CANDIDATES_UNTIL_OFFER_SENT,
-      sendCandidates: SEND_RELAY_UDP_ONLY ? "relay/udp only" : "all",
+      sendCandidates: this.icePolicy.mode,
       maxRelayUdpCandidatesPerMid: MAX_RELAY_UDP_CANDIDATES_PER_MID,
       serverCount: iceServers.length,
       urls: iceServers.flatMap((s) => s.urls),
@@ -355,33 +527,57 @@ class KvsViewer {
     this.sdpOfferSent = false;
     this.queuedLocalIceCandidates = [];
     this.sentRelayUdpCandidateCountsByMid = new Map();
+    this.sentLocalCandidateCountsByMid = new Map();
   }
 
   handleLocalIceCandidate(candidate) {
-    const summary = summarizeIceCandidate(candidate);
+    const candidateForSignaling = rewriteIceCandidateForSignaling(
+      candidate,
+      this.viewerHostCandidateIp
+    );
+    const summary = summarizeIceCandidate(candidateForSignaling);
 
-    if (!shouldSendIceCandidate(candidate)) {
-      log("INFO", "Dropped non relay/udp local ICE candidate", summary);
+    if (!shouldSendIceCandidateForPolicy(candidateForSignaling, this.icePolicy)) {
+      log("INFO", "Dropped local ICE candidate by policy", { iceMode: this.icePolicy.mode, ...summary });
       return;
     }
-
     if (DEFER_ICE_CANDIDATES_UNTIL_OFFER_SENT && !this.sdpOfferSent) {
-      this.queuedLocalIceCandidates.push(candidate);
-      log("INFO", "Queued relay/udp local ICE candidate until SDP offer is sent", summary);
+      this.queuedLocalIceCandidates.push(candidateForSignaling);
+      log("INFO", "Queued local ICE candidate until SDP offer is sent", summary);
       return;
     }
-
-    this.sendLocalIceCandidateIfAllowed(candidate, "Sent relay/udp local ICE candidate");
+    this.sendLocalIceCandidateIfAllowed(candidateForSignaling, "Sent local ICE candidate");
   }
 
   sendLocalIceCandidateIfAllowed(candidate, logMessage) {
     const mid = getCandidateMid(candidate);
+    const candidateType = getCandidateType(candidate);
+
+    if (!isRelayUdpCandidate(candidate)) {
+      const sentCount = this.sentLocalCandidateCountsByMid.get(mid) ?? 0;
+      if (sentCount >= MAX_LOCAL_UDP_CANDIDATES_PER_MID) {
+        log("INFO", "Dropped extra local UDP ICE candidate for same mid", {
+          mid,
+          sentCount,
+          maxPerMid: MAX_LOCAL_UDP_CANDIDATES_PER_MID,
+          ...summarizeIceCandidate(candidate),
+        });
+        return false;
+      }
+
+      this.sentLocalCandidateCountsByMid.set(mid, sentCount + 1);
+      this.signalingClient.sendIceCandidate(candidate);
+      log("INFO", logMessage, { mid, sentCount: sentCount + 1, candidateType, ...summarizeIceCandidate(candidate) });
+      return true;
+    }
+
     const sentCount = this.sentRelayUdpCandidateCountsByMid.get(mid) ?? 0;
 
     if (sentCount >= MAX_RELAY_UDP_CANDIDATES_PER_MID) {
       log("INFO", "Dropped extra relay/udp local ICE candidate for same mid", {
         mid,
         sentCount,
+        maxPerMid: MAX_RELAY_UDP_CANDIDATES_PER_MID,
         ...summarizeIceCandidate(candidate),
       });
       return false;
@@ -392,6 +588,7 @@ class KvsViewer {
     log("INFO", logMessage, {
       mid,
       sentCount: sentCount + 1,
+      candidateType,
       ...summarizeIceCandidate(candidate),
     });
     return true;
@@ -407,7 +604,7 @@ class KvsViewer {
     this.queuedLocalIceCandidates = [];
 
     for (const candidate of candidates) {
-      this.sendLocalIceCandidateIfAllowed(candidate, "Flushed queued relay/udp local ICE candidate after SDP offer");
+      this.sendLocalIceCandidateIfAllowed(candidate, "Flushed queued local ICE candidate after SDP offer");
     }
   }
 
@@ -462,7 +659,11 @@ class KvsViewer {
 
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
-      this.signalingClient.sendSdpOffer(this.pc.localDescription);
+      const offerForSignaling = rewriteLocalDescriptionForSignaling(
+        this.pc.localDescription,
+        this.viewerHostCandidateIp
+      );
+      this.signalingClient.sendSdpOffer(offerForSignaling);
       this.sdpOfferSent = true;
 
       log("INFO", "Sent video-only H264-only recvonly SDP offer", { mLineOrder: ["video"] });
@@ -471,7 +672,7 @@ class KvsViewer {
 
     this.signalingClient.on("sdpAnswer", async (answer) => {
       try {
-        await this.pc.setRemoteDescription(answer);
+        await this.pc.setRemoteDescription(sanitizeRemoteDescription(answer, this.icePolicy.dropRelay));
         log("INFO", "Applied SDP answer");
       } catch (e) {
         log("ERROR", "setRemoteDescription failed", e);
@@ -481,6 +682,10 @@ class KvsViewer {
 
     this.signalingClient.on("iceCandidate", async (candidate) => {
       try {
+        if (this.icePolicy.dropRelay && isIceCandidateRelay(candidate)) {
+          log("INFO", "Dropped remote relay ICE candidate", summarizeIceCandidate(candidate));
+          return;
+        }
         await this.pc.addIceCandidate(candidate);
       } catch (e) {
         log("WARN", "addIceCandidate failed", e);
