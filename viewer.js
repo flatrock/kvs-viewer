@@ -1,4 +1,4 @@
-// v7
+// 2026.06.28a
 
 import {
   KinesisVideoClient,
@@ -73,6 +73,13 @@ const ICE_MODE_PARAM = "iceMode";
 const DEFAULT_ICE_MODE = "no-relay";
 const VALID_ICE_MODES = new Set(["lan-only", "no-relay", "all", "relay-only"]);
 const MAX_LOCAL_UDP_CANDIDATES_PER_MID = 2;
+
+const CONTROL_DATA_CHANNEL_LABEL = "control";
+const CONTROL_MESSAGE_STOP_MEDIA_STREAM = "StopMediaStream";
+const CONTROL_MESSAGE_STOP_MEDIA_STREAM_RESULT = "StopMediaStream_Result";
+const CONTROL_ENDPOINT_VIEWER = "viewer";
+const CONTROL_ENDPOINT_MASTER = "master";
+const STOP_MEDIA_STREAM_RESULT_TIMEOUT_MS = 5000;
 
 function readIcePolicyFromUrl() {
   const params = new URLSearchParams(window.location.search);
@@ -306,6 +313,30 @@ function formatLogArg(arg) {
 function setText(el, text) {
   if (el) el.textContent = text;
 }
+function createMessageId(prefix = "viewer") {
+  if (crypto?.randomUUID) return crypto.randomUUID();
+  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function createStopMediaStreamMessage() {
+  return {
+    message_id: createMessageId("viewer"),
+    from: CONTROL_ENDPOINT_VIEWER,
+    to: CONTROL_ENDPOINT_MASTER,
+    type: CONTROL_MESSAGE_STOP_MEDIA_STREAM,
+    timestamp: Date.now(),
+  };
+}
+
+function parseJsonMessage(data) {
+  if (typeof data !== "string") return null;
+  try {
+    return JSON.parse(data);
+  } catch (e) {
+    log("WARN", "Failed to parse DataChannel JSON", e, data);
+    return null;
+  }
+}
 
 function readConfig() {
   const region = els.region?.value.trim() || "us-west-2";
@@ -358,6 +389,8 @@ class KvsViewer {
     this.sentLocalCandidateCountsByMid = new Map();
     this.viewerHostCandidateIp = "";
     this.icePolicy = readIcePolicyFromUrl();
+    this.controlDataChannel = null;
+    this.pendingStopMediaStream = null;
   }
 
   async start(config) {
@@ -399,10 +432,57 @@ class KvsViewer {
     this.signalingClient.open();
   }
 
-  async stop() {
-    log("INFO", "Stopping viewer");
+  async stop({ graceful = true } = {}) {
+    log("INFO", "Stopping viewer", { graceful });
     recorder.stopRecording();
 
+    if (graceful) {
+      await this.requestStopMediaStream();
+    }
+
+    await this.closeLocalResources();
+  }
+
+  async requestStopMediaStream() {
+    if (!this.controlDataChannel || this.controlDataChannel.readyState !== "open") {
+      log("WARN", "Control DataChannel is not open; close viewer locally without StopMediaStream");
+      return false;
+    }
+
+    const request = createStopMediaStreamMessage();
+    log("INFO", "Sending StopMediaStream", request);
+
+    try {
+      const resultPromise = new Promise((resolve) => {
+        this.pendingStopMediaStream = {
+          requestMessageId: request.message_id,
+          resolve,
+        };
+      });
+
+      this.controlDataChannel.send(JSON.stringify(request));
+
+      const timeoutPromise = new Promise((resolve) => {
+        setTimeout(() => {
+          if (this.pendingStopMediaStream?.requestMessageId === request.message_id) {
+            log("WARN", "Timed out waiting for StopMediaStream_Result", {
+              requestMessageId: request.message_id,
+            });
+            this.pendingStopMediaStream = null;
+            resolve(false);
+          }
+        }, STOP_MEDIA_STREAM_RESULT_TIMEOUT_MS);
+      });
+
+      return await Promise.race([resultPromise, timeoutPromise]);
+    } catch (e) {
+      log("WARN", "Failed to send StopMediaStream", e);
+      this.pendingStopMediaStream = null;
+      return false;
+    }
+  }
+
+  async closeLocalResources() {
     if (this.signalingClient) {
       this.signalingClient.close();
       this.signalingClient = null;
@@ -415,6 +495,13 @@ class KvsViewer {
       this.frameReader = null;
     }
 
+    if (this.controlDataChannel) {
+      try {
+        this.controlDataChannel.close();
+      } catch (_) {}
+      this.controlDataChannel = null;
+    }
+
     if (this.pc) {
       this.pc.getSenders().forEach((sender) => sender.track?.stop());
       this.pc.getReceivers().forEach((receiver) => receiver.track?.stop());
@@ -422,6 +509,7 @@ class KvsViewer {
       this.pc = null;
     }
 
+    this.pendingStopMediaStream = null;
     this.videoTrack = null;
     this.remoteStream = null;
     this.resetCandidateGate();
@@ -608,6 +696,64 @@ class KvsViewer {
     }
   }
 
+  createControlDataChannel() {
+    if (!this.pc) return;
+    if (this.controlDataChannel) {
+      try {
+        this.controlDataChannel.close();
+      } catch (_) {}
+      this.controlDataChannel = null;
+    }
+
+    this.controlDataChannel = this.pc.createDataChannel(CONTROL_DATA_CHANNEL_LABEL);
+    this.installControlDataChannelHandlers(this.controlDataChannel);
+    log("INFO", "Created control DataChannel before SDP offer", { label: CONTROL_DATA_CHANNEL_LABEL });
+  }
+
+  installControlDataChannelHandlers(channel) {
+    channel.onopen = () => {
+      log("INFO", "Control DataChannel open", { label: channel.label });
+    };
+    channel.onclose = () => {
+      log("INFO", "Control DataChannel closed", { label: channel.label });
+    };
+    channel.onerror = (event) => {
+      log("WARN", "Control DataChannel error", event);
+    };
+    channel.onmessage = (event) => {
+      this.handleControlDataChannelMessage(event.data);
+    };
+  }
+
+  handleControlDataChannelMessage(data) {
+    const message = parseJsonMessage(data);
+    if (!message) return;
+
+    log("INFO", "Control DataChannel message", message);
+
+    if (message.type !== CONTROL_MESSAGE_STOP_MEDIA_STREAM_RESULT) {
+      log("INFO", "Ignored unsupported control message type", { type: message.type });
+      return;
+    }
+
+    const requestMessageId = message.Data?.RequestMessageId;
+    if (message.Error) {
+      log("WARN", "StopMediaStream_Result contains Error", message.Error);
+    }
+
+    if (this.pendingStopMediaStream &&
+        this.pendingStopMediaStream.requestMessageId === requestMessageId) {
+      const resolve = this.pendingStopMediaStream.resolve;
+      this.pendingStopMediaStream = null;
+      resolve(!message.Error);
+      return;
+    }
+
+    log("WARN", "Received StopMediaStream_Result without matching request", {
+      requestMessageId,
+    });
+  }
+
   installPeerConnectionHandlers() {
     this.pc.ontrack = (event) => {
       log("INFO", "Received remote track", { kind: event.track.kind });
@@ -657,6 +803,10 @@ class KvsViewer {
       const videoTransceiver = this.pc.addTransceiver("video", { direction: "recvonly" });
       preferH264CodecForTransceiver(videoTransceiver);
 
+      // Create the control DataChannel before createOffer() so that the SDP offer
+      // contains an m=application section for SCTP/DataChannel negotiation.
+      this.createControlDataChannel();
+
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
       const offerForSignaling = rewriteLocalDescriptionForSignaling(
@@ -666,7 +816,7 @@ class KvsViewer {
       this.signalingClient.sendSdpOffer(offerForSignaling);
       this.sdpOfferSent = true;
 
-      log("INFO", "Sent video-only H264-only recvonly SDP offer", { mLineOrder: ["video"] });
+      log("INFO", "Sent H264 recvonly SDP offer with control DataChannel", { mLineOrder: ["video", "application"] });
       this.flushQueuedLocalIceCandidates();
     });
 
@@ -889,9 +1039,10 @@ if (els.startViewer) {
 
 if (els.stopViewer) {
   els.stopViewer.addEventListener("click", async () => {
-    await viewer.stop();
-    if (els.startViewer) els.startViewer.disabled = false;
     els.stopViewer.disabled = true;
+    setText(els.signalingStatus, "stopping");
+    await viewer.stop({ graceful: true });
+    if (els.startViewer) els.startViewer.disabled = false;
     recorder.updateButtons();
   });
 }
@@ -903,5 +1054,5 @@ if (els.clearLogs) els.clearLogs.addEventListener("click", () => { els.logs.text
 
 window.addEventListener("beforeunload", () => {
   recorder.stopRecording();
-  viewer.stop();
+  viewer.stop({ graceful: false });
 });
