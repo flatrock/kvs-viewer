@@ -1,4 +1,4 @@
-// 2026.06.28a
+// 2026.07.02a
 
 import {
   KinesisVideoClient,
@@ -62,7 +62,7 @@ const els = {
 const USE_RELAY_ONLY = false;
 const USE_KVS_TURN_SERVERS = false;
 const USE_ONLY_ONE_TURN_SERVER_SET = true;
-const ADD_KVS_STUN_SERVER = false;
+const ADD_KVS_STUN_SERVER = true;
 const DEFER_ICE_CANDIDATES_UNTIL_OFFER_SENT = true;
 const SEND_RELAY_UDP_ONLY = false;
 const DROP_RELAY_CANDIDATES = true;
@@ -72,7 +72,7 @@ const VIEWER_HOST_CANDIDATE_IP_PARAM = "viewerIp";
 const ICE_MODE_PARAM = "iceMode";
 const DEFAULT_ICE_MODE = "no-relay";
 const VALID_ICE_MODES = new Set(["lan-only", "no-relay", "all", "relay-only"]);
-const MAX_LOCAL_UDP_CANDIDATES_PER_MID = 2;
+const MAX_LOCAL_UDP_CANDIDATES_PER_MID = 4;
 
 const CONTROL_DATA_CHANNEL_LABEL = "control";
 const CONTROL_MESSAGE_STOP_MEDIA_STREAM = "StopMediaStream";
