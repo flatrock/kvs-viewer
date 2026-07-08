@@ -1,4 +1,4 @@
-// 2026.07.02a
+// 2026.07.08a
 
 import {
   KinesisVideoClient,
@@ -80,6 +80,10 @@ const CONTROL_MESSAGE_STOP_MEDIA_STREAM_RESULT = "StopMediaStream_Result";
 const CONTROL_ENDPOINT_VIEWER = "viewer";
 const CONTROL_ENDPOINT_MASTER = "master";
 const STOP_MEDIA_STREAM_RESULT_TIMEOUT_MS = 5000;
+const RECORDER_PIXEL_FORMAT = "I420";
+const RECORDER_PACKET_MAGIC_VALUE = 0x31434552; // 'REC1'
+const RECORDER_PACKET_VERSION = 1;
+const RECORDER_PACKET_HEADER_BYTES = 28;
 
 function readIcePolicyFromUrl() {
   const params = new URLSearchParams(window.location.search);
@@ -307,6 +311,12 @@ function formatLogArg(arg) {
     return JSON.stringify(arg);
   } catch {
     return String(arg);
+  }
+}
+
+function writeFourCC(view, offset, fourcc) {
+  for (let i = 0; i < 4; i++) {
+    view.setUint8(offset + i, fourcc.charCodeAt(i));
   }
 }
 
@@ -932,6 +942,10 @@ class RecorderBridge {
       height: this.height,
       fps,
       segment_time_seconds: segmentTimeSeconds,
+
+      pixel_format: RECORDER_PIXEL_FORMAT,
+      packet_version: RECORDER_PACKET_VERSION,
+      packet_header_bytes: RECORDER_PACKET_HEADER_BYTES,
     }));
 
     log("INFO", "REC started", { recorderId, width: this.width, height: this.height, fps, segmentTimeSeconds });
@@ -962,20 +976,44 @@ class RecorderBridge {
     const processor = new MediaStreamTrackProcessor({ track: this.videoTrack });
     this.frameReader = processor.readable.getReader();
 
+    let firstFrameLogged = false;
     try {
       while (this.recording) {
         const { value: frame, done } = await this.frameReader.read();
         if (done || !this.recording) break;
 
-        const timestampUs = frame.timestamp ?? Math.round(performance.now() * 1000);
-        const size = frame.allocationSize();
+        const copyOptions = { format: RECORDER_PIXEL_FORMAT };
+        const size = frame.allocationSize(copyOptions);
         const raw = new Uint8Array(size);
-        await frame.copyTo(raw);
+        await frame.copyTo(raw, copyOptions);
 
-        const packet = new ArrayBuffer(8 + size);
+        const timestampUs = frame.timestamp ?? Math.round(performance.now() * 1000);
+        const width = frame.codedWidth || frame.displayWidth || this.width;
+        const height = frame.codedHeight || frame.displayHeight || this.height;
+
+        const packet = new ArrayBuffer(RECORDER_PACKET_HEADER_BYTES + size);
         const view = new DataView(packet);
-        view.setBigUint64(0, BigInt(timestampUs), true);
-        new Uint8Array(packet, 8).set(raw);
+        view.setUint32(0, RECORDER_PACKET_MAGIC_VALUE, true);  // magic 'REC1'
+        view.setUint16(4, RECORDER_PACKET_VERSION, true);      // version
+        writeFourCC(view, 6, RECORDER_PIXEL_FORMAT);           // fourcc 'I420'
+        view.setUint16(10, width & 0xFFFF, true);              // width
+        view.setUint16(12, height & 0xFFFF, true);             // height
+        view.setBigUint64(14, BigInt(timestampUs), true);      // timestampUs
+        view.setUint32(22, size >>> 0, true);                  // payloadSize
+        view.setUint16(26, 0, true);                           // reserved
+        new Uint8Array(packet, RECORDER_PACKET_HEADER_BYTES).set(raw);
+
+        if (!firstFrameLogged) {
+          firstFrameLogged = true;
+          log("INFO", "REC first frame", {
+            requestedFormat: RECORDER_PIXEL_FORMAT,
+            width,
+            height,
+            payloadBytes: size,
+            headerBytes: RECORDER_PACKET_HEADER_BYTES,
+            packetVersion: RECORDER_PACKET_VERSION,
+          });
+        }
 
         if (this.wsConnected) this.ws.send(packet);
         frame.close();
