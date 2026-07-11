@@ -1,4 +1,4 @@
-// 2026.07.08a
+// 2026.07.11a
 
 import {
   KinesisVideoClient,
@@ -808,10 +808,11 @@ class KvsViewer {
       log("INFO", "Signaling connection opened");
       setText(els.signalingStatus, "open");
 
-      // Video-only offer: make video the BUNDLE mid:0 transport.
-      // This avoids an inactive audio m-line becoming the bundle-tag.
+      // video
       const videoTransceiver = this.pc.addTransceiver("video", { direction: "recvonly" });
       preferH264CodecForTransceiver(videoTransceiver);
+      // audio
+      this.pc.addTransceiver("audio", { direction: "recvonly" });
 
       // Create the control DataChannel before createOffer() so that the SDP offer
       // contains an m=application section for SCTP/DataChannel negotiation.
@@ -826,7 +827,7 @@ class KvsViewer {
       this.signalingClient.sendSdpOffer(offerForSignaling);
       this.sdpOfferSent = true;
 
-      log("INFO", "Sent H264 recvonly SDP offer with control DataChannel", { mLineOrder: ["video", "application"] });
+      log("INFO", "Sent H264 video + audio recvonly SDP offer with control DataChannel", { mLineOrder: ["video", "audio", "application"] });
       this.flushQueuedLocalIceCandidates();
     });
 
