@@ -80,10 +80,13 @@ const CONTROL_MESSAGE_STOP_MEDIA_STREAM_RESULT = "StopMediaStream_Result";
 const CONTROL_ENDPOINT_VIEWER = "viewer";
 const CONTROL_ENDPOINT_MASTER = "master";
 const STOP_MEDIA_STREAM_RESULT_TIMEOUT_MS = 5000;
-const RECORDER_PIXEL_FORMAT = "I420";
-const RECORDER_PACKET_MAGIC_VALUE = 0x31434552; // 'REC1'
+const RECORDER_VIDEO_PIXEL_FORMAT = "I420";
+const RECORDER_AUDIO_SAMPLE_FORMAT = "s16";
+const RECORDER_PACKET_MAGIC_VALUE = 0x4B524543; // 'KREC'
 const RECORDER_PACKET_VERSION = 1;
-const RECORDER_PACKET_HEADER_BYTES = 28;
+const RECORDER_PACKET_HEADER_BYTES = 32;
+const RECORDER_MEDIA_TYPE_VIDEO = 0;
+const RECORDER_MEDIA_TYPE_AUDIO = 1;
 
 function readIcePolicyFromUrl() {
   const params = new URLSearchParams(window.location.search);
@@ -318,6 +321,89 @@ function writeFourCC(view, offset, fourcc) {
   for (let i = 0; i < 4; i++) {
     view.setUint8(offset + i, fourcc.charCodeAt(i));
   }
+}
+function writeRecorderHeader(view, mediaType, timestampUs, payloadSize, sampleRate, channels, bitsPerSample) {
+  view.setUint32(0, RECORDER_PACKET_MAGIC_VALUE, true);
+  view.setUint8(4, RECORDER_PACKET_VERSION);
+  view.setUint8(5, mediaType);
+  view.setUint16(6, 0, true);
+  view.setBigUint64(8, BigInt(timestampUs), true);
+  view.setUint32(16, payloadSize >>> 0, true);
+  view.setUint32(20, (sampleRate || 0) >>> 0, true);
+  view.setUint16(24, (channels || 0) & 0xFFFF, true);
+  view.setUint16(26, (bitsPerSample || 0) & 0xFFFF, true);
+  view.setUint32(28, 0, true);
+}
+async function copyVideoFrameAsI420(frame) {
+  const copyOptions = { format: RECORDER_VIDEO_PIXEL_FORMAT };
+  try {
+    const size = frame.allocationSize(copyOptions);
+    const raw = new Uint8Array(size);
+    await frame.copyTo(raw, copyOptions);
+    return raw;
+  } catch (e) {
+    if (e?.name !== "NotSupportedError") throw e;
+    const width = frame.codedWidth || frame.displayWidth;
+    const height = frame.codedHeight || frame.displayHeight;
+    if (!width || !height || (width & 1) || (height & 1)) {
+      throw new Error(`I420 fallback requires non-zero even dimensions: ${width}x${height}`);
+    }
+    const canvas = typeof OffscreenCanvas !== "undefined"
+      ? new OffscreenCanvas(width, height)
+      : Object.assign(document.createElement("canvas"), { width, height });
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) throw new Error("Failed to create a 2D canvas context for I420 fallback.");
+    context.drawImage(frame, 0, 0, width, height);
+    const rgba = context.getImageData(0, 0, width, height).data;
+    log("INFO", "Used Canvas RGBA-to-I420 fallback", { width, height });
+    return rgbaToI420(rgba, width, height);
+  }
+}
+function rgbaToI420(rgba, width, height) {
+  const ySize = width * height;
+  const uvWidth = width >> 1;
+  const uvHeight = height >> 1;
+  const uOffset = ySize;
+  const vOffset = ySize + uvWidth * uvHeight;
+  const output = new Uint8Array(ySize + 2 * uvWidth * uvHeight);
+  const clampByte = (value) => Math.max(0, Math.min(255, value));
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const src = (y * width + x) * 4;
+      const r = rgba[src], g = rgba[src + 1], b = rgba[src + 2];
+      output[y * width + x] = clampByte(Math.round(16 + 0.257 * r + 0.504 * g + 0.098 * b));
+    }
+  }
+  for (let y = 0; y < height; y += 2) {
+    for (let x = 0; x < width; x += 2) {
+      let u = 0, v = 0;
+      for (let dy = 0; dy < 2; dy++) {
+        for (let dx = 0; dx < 2; dx++) {
+          const src = ((y + dy) * width + x + dx) * 4;
+          const r = rgba[src], g = rgba[src + 1], b = rgba[src + 2];
+          u += 128 - 0.148 * r - 0.291 * g + 0.439 * b;
+          v += 128 + 0.439 * r - 0.368 * g - 0.071 * b;
+        }
+      }
+      const uvIndex = (y >> 1) * uvWidth + (x >> 1);
+      output[uOffset + uvIndex] = clampByte(Math.round(u / 4));
+      output[vOffset + uvIndex] = clampByte(Math.round(v / 4));
+    }
+  }
+  return output;
+}
+function normalizePcmS16ToStereo(raw, channels) {
+  if (channels === 2) return raw;
+  if (!Number.isInteger(channels) || channels < 1) throw new Error(`Invalid audio channel count: ${channels}`);
+  const input = new Int16Array(raw.buffer, raw.byteOffset, raw.byteLength / 2);
+  const frames = Math.floor(input.length / channels);
+  const output = new Int16Array(frames * 2);
+  for (let i = 0; i < frames; i++) {
+    const left = input[i * channels];
+    output[i * 2] = left;
+    output[i * 2 + 1] = channels > 1 ? input[i * channels + 1] : left;
+  }
+  return new Uint8Array(output.buffer);
 }
 
 function setText(el, text) {
@@ -781,6 +867,8 @@ class KvsViewer {
         this.width = settings.width ?? this.width;
         this.height = settings.height ?? this.height;
         recorder.setVideoTrack(event.track, this.width, this.height);
+      } else if (event.track.kind === "audio") {
+        recorder.setAudioTrack(event.track);
       }
     };
 
@@ -871,7 +959,9 @@ class RecorderBridge {
     this.wsConnected = false;
     this.recording = false;
     this.frameReader = null;
+    this.audioReader = null;
     this.videoTrack = null;
+    this.audioTrack = null;
     this.width = 1280;
     this.height = 720;
   }
@@ -881,6 +971,11 @@ class RecorderBridge {
     this.width = width ?? this.width;
     this.height = height ?? this.height;
     this.updateButtons();
+  }
+
+  setAudioTrack(track) {
+    this.audioTrack = track;
+    if (this.recording && this.audioTrack && !this.audioReader) this.readAudioLoop();
   }
 
   connect() {
@@ -944,13 +1039,15 @@ class RecorderBridge {
       fps,
       segment_time_seconds: segmentTimeSeconds,
 
-      pixel_format: RECORDER_PIXEL_FORMAT,
+      pixel_format: RECORDER_VIDEO_PIXEL_FORMAT,
       packet_version: RECORDER_PACKET_VERSION,
       packet_header_bytes: RECORDER_PACKET_HEADER_BYTES,
+      has_audio: !!this.audioTrack,
     }));
 
-    log("INFO", "REC started", { recorderId, width: this.width, height: this.height, fps, segmentTimeSeconds });
+    log("INFO", "REC started", { recorderId, width: this.width, height: this.height, fps, segmentTimeSeconds, hasAudio: !!this.audioTrack });
     this.readFramesLoop(fps);
+    if (this.audioTrack) this.readAudioLoop();
   }
 
   stopRecording(sendClose = true) {
@@ -959,6 +1056,11 @@ class RecorderBridge {
     this.recording = false;
     setText(els.recStatus, "idle");
     this.updateButtons();
+
+    if (this.audioReader) {
+      try { this.audioReader.cancel(); } catch (_) {}
+      this.audioReader = null;
+    }
 
     if (sendClose && this.wsConnected) {
       const recorderId = els.recorderId?.value.trim() || "1";
@@ -983,10 +1085,8 @@ class RecorderBridge {
         const { value: frame, done } = await this.frameReader.read();
         if (done || !this.recording) break;
 
-        const copyOptions = { format: RECORDER_PIXEL_FORMAT };
-        const size = frame.allocationSize(copyOptions);
-        const raw = new Uint8Array(size);
-        await frame.copyTo(raw, copyOptions);
+        const raw = await copyVideoFrameAsI420(frame);
+        const size = raw.byteLength;
 
         const timestampUs = frame.timestamp ?? Math.round(performance.now() * 1000);
         const width = frame.codedWidth || frame.displayWidth || this.width;
@@ -994,20 +1094,13 @@ class RecorderBridge {
 
         const packet = new ArrayBuffer(RECORDER_PACKET_HEADER_BYTES + size);
         const view = new DataView(packet);
-        view.setUint32(0, RECORDER_PACKET_MAGIC_VALUE, true);  // magic 'REC1'
-        view.setUint16(4, RECORDER_PACKET_VERSION, true);      // version
-        writeFourCC(view, 6, RECORDER_PIXEL_FORMAT);           // fourcc 'I420'
-        view.setUint16(10, width & 0xFFFF, true);              // width
-        view.setUint16(12, height & 0xFFFF, true);             // height
-        view.setBigUint64(14, BigInt(timestampUs), true);      // timestampUs
-        view.setUint32(22, size >>> 0, true);                  // payloadSize
-        view.setUint16(26, 0, true);                           // reserved
+        writeRecorderHeader(view, RECORDER_MEDIA_TYPE_VIDEO, timestampUs, size, 0, 0, 0);
         new Uint8Array(packet, RECORDER_PACKET_HEADER_BYTES).set(raw);
 
         if (!firstFrameLogged) {
           firstFrameLogged = true;
           log("INFO", "REC first frame", {
-            requestedFormat: RECORDER_PIXEL_FORMAT,
+            requestedFormat: RECORDER_VIDEO_PIXEL_FORMAT,
             width,
             height,
             payloadBytes: size,
@@ -1028,6 +1121,44 @@ class RecorderBridge {
         await this.frameReader?.cancel();
       } catch (_) {}
       this.frameReader = null;
+    }
+  }
+
+  async readAudioLoop() {
+    if (typeof MediaStreamTrackProcessor === "undefined" || !this.audioTrack) return;
+    const processor = new MediaStreamTrackProcessor({ track: this.audioTrack });
+    this.audioReader = processor.readable.getReader();
+    let firstAudioLogged = false;
+    try {
+      while (this.recording) {
+        const { value: audioData, done } = await this.audioReader.read();
+        if (done || !this.recording) break;
+        const copyOptions = { planeIndex: 0, format: RECORDER_AUDIO_SAMPLE_FORMAT };
+        const sourceSize = audioData.allocationSize(copyOptions);
+        const sourceRaw = new Uint8Array(sourceSize);
+        audioData.copyTo(sourceRaw, copyOptions);
+        const sampleRate = audioData.sampleRate;
+        const sourceChannels = audioData.numberOfChannels;
+        const channels = 2;
+        const raw = normalizePcmS16ToStereo(sourceRaw, sourceChannels);
+        const size = raw.byteLength;
+        const timestampUs = audioData.timestamp ?? Math.round(performance.now() * 1000);
+        const packet = new ArrayBuffer(RECORDER_PACKET_HEADER_BYTES + size);
+        const view = new DataView(packet);
+        writeRecorderHeader(view, RECORDER_MEDIA_TYPE_AUDIO, timestampUs, size, sampleRate, channels, 16);
+        new Uint8Array(packet, RECORDER_PACKET_HEADER_BYTES).set(raw);
+        if (!firstAudioLogged) {
+          firstAudioLogged = true;
+          log("INFO", "REC first audio frame", { sampleRate, sourceChannels, channels, numberOfFrames: audioData.numberOfFrames, payloadBytes: size, headerBytes: RECORDER_PACKET_HEADER_BYTES });
+        }
+        if (this.wsConnected) this.ws.send(packet);
+        audioData.close();
+      }
+    } catch (e) {
+      log("ERROR", "Audio read loop failed", e);
+    } finally {
+      try { await this.audioReader?.cancel(); } catch (_) {}
+      this.audioReader = null;
     }
   }
 
