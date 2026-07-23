@@ -62,7 +62,7 @@ REM ====== Open Viewer without putting AWS credentials in the URL ======
 REM Enter the Access Key ID, Secret Access Key, and optional Session Token in
 REM the Viewer form after the page opens. Credentials are not echoed or logged
 REM by this batch file.
-set "VIEWER_URL=http://localhost:%PORT%/viewer.html?channelArn=%ENC_CHANNEL_ARN%&region=%ENC_REGION%&viewerIp=127.0.0.1"
+set "VIEWER_URL=http://localhost:%PORT%/viewer.html?channelArn=%ENC_CHANNEL_ARN%&region=%ENC_REGION%&viewerIp=%ENC_VIEWER_IP%"
 start "" "%VIEWER_URL%"
 
 endlocal
