@@ -1,4 +1,4 @@
-// 2026.07.23a
+// 2026.07.23b
 
 import {
   KinesisVideoClient,
@@ -460,7 +460,6 @@ function readConfig() {
 
 function applyUrlParams() {
   const params = new URLSearchParams(window.location.search);
-
   for (const [param, el] of [
     ["region", els.region],
     ["channelArn", els.channelArn],
@@ -468,18 +467,6 @@ function applyUrlParams() {
   ]) {
     const value = params.get(param);
     if (value && el) el.value = value;
-  }
-
-  // Use the same LAN IPv4 address as viewerIp for the local Recorder.
-  // This avoids a loopback connection to 127.0.0.1 from GitHub Pages.
-  const viewerIp = readViewerHostCandidateIpFromUrl();
-
-  if (viewerIp && els.recorderWsUrl) {
-    els.recorderWsUrl.value = `ws://${viewerIp}:8080`;
-
-    log("INFO", "Configured Recorder WebSocket URL from viewerIp", {
-      recorderWsUrl: els.recorderWsUrl.value,
-    });
   }
 }
 
