@@ -1,4 +1,4 @@
-// 2026.07.25a
+// 2026.09.24a
 
 import {
   KinesisVideoClient,
@@ -80,6 +80,9 @@ const CONTROL_MESSAGE_STOP_MEDIA_STREAM_RESULT = "StopMediaStream_Result";
 const CONTROL_ENDPOINT_VIEWER = "viewer";
 const CONTROL_ENDPOINT_MASTER = "master";
 const STOP_MEDIA_STREAM_RESULT_TIMEOUT_MS = 5000;
+const SDP_OFFER_RETRY_INTERVAL_MS = 3000;
+const PEER_CONNECTION_DISCONNECTED_RECOVERY_DELAY_MS = 5000;
+const PEER_CONNECTION_FAILED_RECOVERY_DELAY_MS = 1000;
 const RECORDER_VIDEO_PIXEL_FORMAT = "I420";
 const RECORDER_AUDIO_SAMPLE_FORMAT = "s16";
 const RECORDER_PACKET_MAGIC_VALUE = 0x4B524543; // 'KREC'
@@ -500,9 +503,20 @@ class KvsViewer {
     this.icePolicy = readIcePolicyFromUrl();
     this.controlDataChannel = null;
     this.pendingStopMediaStream = null;
+    this.sdpAnswerReceived = false;
+    this.sdpOfferRetryTimer = null;
+    this.localIceCandidatesForReplay = [];
+    this.lastConfig = null;
+    this.recoveryTimer = null;
+    this.recoveryInProgress = false;
+    this.stopRequested = false;
+    this.connectionGeneration = 0;
   }
 
   async start(config) {
+    this.lastConfig = config;
+    this.stopRequested = false;
+    const generation = ++this.connectionGeneration;
     this.icePolicy = readIcePolicyFromUrl();
     this.viewerHostCandidateIp = readViewerHostCandidateIpFromUrl();
 
@@ -514,6 +528,8 @@ class KvsViewer {
       iceMode: this.icePolicy.mode,
     });
     this.resetCandidateGate();
+    this.sdpAnswerReceived = false;
+    this.stopSdpOfferRetry();
     setText(els.signalingStatus, "resolving endpoints");
 
     const endpoints = await this.getSignalingEndpoints(config);
@@ -524,7 +540,7 @@ class KvsViewer {
       iceTransportPolicy: this.icePolicy.useRelayOnly ? "relay" : "all",
     });
 
-    this.installPeerConnectionHandlers();
+    this.installPeerConnectionHandlers(generation);
 
     this.signalingClient = new KVSWebRTC.SignalingClient({
       role: KVSWebRTC.Role.VIEWER,
@@ -542,6 +558,8 @@ class KvsViewer {
   }
 
   async stop({ graceful = true } = {}) {
+    this.stopRequested = true;
+    this.cancelPeerConnectionRecovery();
     log("INFO", "Stopping viewer", { graceful });
     recorder.stopRecording();
 
@@ -592,9 +610,13 @@ class KvsViewer {
   }
 
   async closeLocalResources() {
+    this.stopSdpOfferRetry();
+    this.cancelPeerConnectionRecovery();
     if (this.signalingClient) {
-      this.signalingClient.close();
+      const signalingClient = this.signalingClient;
       this.signalingClient = null;
+      signalingClient.removeAllListeners?.();
+      signalingClient.close();
     }
 
     if (this.frameReader) {
@@ -612,6 +634,11 @@ class KvsViewer {
     }
 
     if (this.pc) {
+      this.pc.ontrack = null;
+      this.pc.onicecandidate = null;
+      this.pc.oniceconnectionstatechange = null;
+      this.pc.onconnectionstatechange = null;
+      this.pc.onicegatheringstatechange = null;
       this.pc.getSenders().forEach((sender) => sender.track?.stop());
       this.pc.getReceivers().forEach((receiver) => receiver.track?.stop());
       this.pc.close();
@@ -619,12 +646,51 @@ class KvsViewer {
     }
 
     this.pendingStopMediaStream = null;
+    this.sdpAnswerReceived = false;
     this.videoTrack = null;
     this.remoteStream = null;
     this.resetCandidateGate();
     if (els.remoteVideo) els.remoteVideo.srcObject = null;
     setText(els.signalingStatus, "idle");
     setText(els.iceStatus, "idle");
+  }
+
+  schedulePeerConnectionRecovery(reason, delayMs) {
+    if (this.stopRequested || this.recoveryInProgress || this.recoveryTimer !== null || !this.lastConfig) return;
+    const generation = this.connectionGeneration;
+    log("WARN", "Scheduled PeerConnection recovery", { reason, delayMs, generation });
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = null;
+      if (this.stopRequested || generation !== this.connectionGeneration) return;
+      this.recoverPeerConnection(reason).catch((e) => {
+        log("ERROR", "PeerConnection recovery failed", e);
+        this.recoveryInProgress = false;
+        this.schedulePeerConnectionRecovery("recovery attempt failed", SDP_OFFER_RETRY_INTERVAL_MS);
+      });
+    }, delayMs);
+  }
+
+  cancelPeerConnectionRecovery() {
+    if (this.recoveryTimer !== null) {
+      clearTimeout(this.recoveryTimer);
+      this.recoveryTimer = null;
+    }
+  }
+
+  async recoverPeerConnection(reason) {
+    if (this.stopRequested || this.recoveryInProgress || !this.lastConfig) return;
+    this.recoveryInProgress = true;
+    const config = this.lastConfig;
+    log("WARN", "Recreating Viewer session after Master disconnect", { reason, previousGeneration: this.connectionGeneration });
+    try {
+      recorder.stopRecording();
+      await this.closeLocalResources();
+      if (this.stopRequested) return;
+      await this.start(config);
+      log("INFO", "Viewer recovery session started", { generation: this.connectionGeneration });
+    } finally {
+      this.recoveryInProgress = false;
+    }
   }
 
   async getSignalingEndpoints(config) {
@@ -725,6 +791,7 @@ class KvsViewer {
     this.queuedLocalIceCandidates = [];
     this.sentRelayUdpCandidateCountsByMid = new Map();
     this.sentLocalCandidateCountsByMid = new Map();
+    this.localIceCandidatesForReplay = [];
   }
 
   handleLocalIceCandidate(candidate) {
@@ -738,6 +805,7 @@ class KvsViewer {
       log("INFO", "Dropped local ICE candidate by policy", { iceMode: this.icePolicy.mode, ...summary });
       return;
     }
+    this.localIceCandidatesForReplay.push(candidateForSignaling);
     if (DEFER_ICE_CANDIDATES_UNTIL_OFFER_SENT && !this.sdpOfferSent) {
       this.queuedLocalIceCandidates.push(candidateForSignaling);
       log("INFO", "Queued local ICE candidate until SDP offer is sent", summary);
@@ -805,6 +873,43 @@ class KvsViewer {
     }
   }
 
+  sendCurrentSdpOffer(reason) {
+    if (!this.pc || !this.signalingClient || this.sdpAnswerReceived) return false;
+    if (this.pc.signalingState !== "have-local-offer" || !this.pc.localDescription) return false;
+
+    const offerForSignaling = rewriteLocalDescriptionForSignaling(
+      this.pc.localDescription,
+      this.viewerHostCandidateIp
+    );
+    this.signalingClient.sendSdpOffer(offerForSignaling);
+    log("INFO", reason, {
+      signalingState: this.pc.signalingState,
+      replayCandidateCount: this.localIceCandidatesForReplay.length,
+    });
+    for (const candidate of this.localIceCandidatesForReplay) {
+      this.signalingClient.sendIceCandidate(candidate);
+    }
+    return true;
+  }
+
+  startSdpOfferRetry() {
+    this.stopSdpOfferRetry();
+    this.sdpOfferRetryTimer = setInterval(() => {
+      try {
+        this.sendCurrentSdpOffer("Retried SDP offer while waiting for Tab 5");
+      } catch (e) {
+        log("WARN", "Failed to retry SDP offer", e);
+      }
+    }, SDP_OFFER_RETRY_INTERVAL_MS);
+  }
+
+  stopSdpOfferRetry() {
+    if (this.sdpOfferRetryTimer !== null) {
+      clearInterval(this.sdpOfferRetryTimer);
+      this.sdpOfferRetryTimer = null;
+    }
+  }
+
   createControlDataChannel() {
     if (!this.pc) return;
     if (this.controlDataChannel) {
@@ -863,8 +968,10 @@ class KvsViewer {
     });
   }
 
-  installPeerConnectionHandlers() {
-    this.pc.ontrack = (event) => {
+  installPeerConnectionHandlers(generation) {
+    const pc = this.pc;
+    pc.ontrack = (event) => {
+      if (generation !== this.connectionGeneration || pc !== this.pc) return;
       log("INFO", "Received remote track", { kind: event.track.kind });
 
       if (!this.remoteStream) {
@@ -885,22 +992,39 @@ class KvsViewer {
       }
     };
 
-    this.pc.onicecandidate = (event) => {
+    pc.onicecandidate = (event) => {
+      if (generation !== this.connectionGeneration || pc !== this.pc) return;
       if (!event.candidate || !this.signalingClient) return;
       this.handleLocalIceCandidate(event.candidate);
     };
 
-    this.pc.oniceconnectionstatechange = () => {
-      setText(els.iceStatus, this.pc.iceConnectionState);
-      log("INFO", "ICE connection state", this.pc.iceConnectionState);
+    pc.oniceconnectionstatechange = () => {
+      if (generation !== this.connectionGeneration || pc !== this.pc) return;
+      setText(els.iceStatus, pc.iceConnectionState);
+      log("INFO", "ICE connection state", pc.iceConnectionState);
+      if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+        this.cancelPeerConnectionRecovery();
+      } else if (pc.iceConnectionState === "failed") {
+        this.schedulePeerConnectionRecovery("ICE connection failed", PEER_CONNECTION_FAILED_RECOVERY_DELAY_MS);
+      }
     };
 
-    this.pc.onconnectionstatechange = () => {
-      log("INFO", "Peer connection state", this.pc.connectionState);
+    pc.onconnectionstatechange = () => {
+      if (generation !== this.connectionGeneration || pc !== this.pc) return;
+      log("INFO", "Peer connection state", pc.connectionState);
+      if (pc.connectionState === "connected") {
+        this.cancelPeerConnectionRecovery();
+      } else if (pc.connectionState === "disconnected") {
+        this.schedulePeerConnectionRecovery("PeerConnection disconnected", PEER_CONNECTION_DISCONNECTED_RECOVERY_DELAY_MS);
+      } else if (pc.connectionState === "failed") {
+        this.cancelPeerConnectionRecovery();
+        this.schedulePeerConnectionRecovery("PeerConnection failed", PEER_CONNECTION_FAILED_RECOVERY_DELAY_MS);
+      }
     };
 
-    this.pc.onicegatheringstatechange = () => {
-      log("INFO", "ICE gathering state", this.pc.iceGatheringState);
+    pc.onicegatheringstatechange = () => {
+      if (generation !== this.connectionGeneration || pc !== this.pc) return;
+      log("INFO", "ICE gathering state", pc.iceGatheringState);
     };
   }
 
@@ -930,12 +1054,15 @@ class KvsViewer {
 
       log("INFO", "Sent H264 video + audio recvonly SDP offer with control DataChannel", { mLineOrder: ["video", "audio", "application"] });
       this.flushQueuedLocalIceCandidates();
+      this.startSdpOfferRetry();
     });
 
     this.signalingClient.on("sdpAnswer", async (answer) => {
       try {
         await this.pc.setRemoteDescription(sanitizeRemoteDescription(answer, this.icePolicy.dropRelay));
-        log("INFO", "Applied SDP answer");
+        this.sdpAnswerReceived = true;
+        this.stopSdpOfferRetry();
+        log("INFO", "Applied SDP answer and stopped SDP offer retry");
       } catch (e) {
         log("ERROR", "setRemoteDescription failed", e);
         throw e;
